@@ -1,0 +1,5 @@
+CUDA_VISIBLE_DEVICES=2 python main.py --dataset cifar100 --data_dir ./data/cifar100/ --root_dir ./experiments/cifar100 --labels_per_class 500 --arch preactresnet18  --learning_rate 0.2 --momentum 0.9 --decay 0.0001 --epochs 300 --schedule 100 200 --gammas 0.1 0.1 --train mixup --mixup_alpha 1.0 --seed 0
+
+CUDA_VISIBLE_DEVICES=2 python main.py --dataset cifar100 --data_dir ./data/cifar100/ --root_dir ./experiments/cifar100 --labels_per_class 500 --arch preactresnet18  --learning_rate 0.2 --momentum 0.9 --decay 0.0001 --epochs 300 --schedule 100 200 --gammas 0.1 0.1 --train mixup_hidden --mixup_alpha 2.0 --seed 0
+
+CUDA_VISIBLE_DEVICES=2 python main.py --dataset cifar100 --data_dir ./data/cifar100/ --root_dir ./experiments/cifar100 --labels_per_class 500 --arch preactresnet18  --learning_rate 0.2 --momentum 0.9 --decay 0.0001 --epochs 300 --schedule 100 200 --gammas 0.1 0.1 --train mixup --mixup_alpha 1.0 --box True --seed 0

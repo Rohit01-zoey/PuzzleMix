@@ -165,6 +165,10 @@ parser.add_argument('--add_name', type=str, default='')
 parser.add_argument('--log_off', type=str2bool, default=False)
 parser.add_argument('--job_id', type=str, default='')
 
+
+parser.add_argument('--supervision', type=str2bool, default=False, help='whether to use supervision i.e. pretrained models for computing unary')
+parser.add_argument('--model_t', type=str, default=None, help='model architecture for computing unary')
+
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
 
@@ -204,6 +208,8 @@ def experiment_name_non_mnist(dataset=args.dataset,
                               job_id=args.job_id,
                               add_name=args.add_name,
                               clean_lam=args.clean_lam,
+                              supervision=args.supervision,
+                              model_t=args.model_t,
                               seed=args.seed):
     '''
     function for experiment result folder name.
@@ -234,6 +240,8 @@ def experiment_name_non_mnist(dataset=args.dataset,
     exp_name += '_seed_' + str(seed)
     if add_name != '':
         exp_name += '_add_name_' + str(add_name)
+    if supervision:
+        exp_name += f'_supervision_[{str(model_t)}]'
 
     print('\nexperiement name: ' + exp_name)
     return exp_name
@@ -296,7 +304,7 @@ criterion = nn.CrossEntropyLoss().cuda()
 criterion_batch = nn.CrossEntropyLoss(reduction='none').cuda()
 
 
-def train(train_loader, model, optimizer, epoch, args, log, mp=None):
+def train(train_loader, model, optimizer, epoch, args, log, model_t = None, mp=None):
     '''train given model and dataloader'''
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -307,6 +315,10 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
 
     # switch to train mode
     model.train()
+    
+    # see if model_t is given
+    if args.supervision:
+        model_t.eval()
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
@@ -355,14 +367,25 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
 
                 # calculate saliency (unary)
                 if args.clean_lam == 0:
-                    model.eval()
-                    output = model(input_var)
-                    loss_batch = criterion_batch(output, target_var)
+                    if args.supervision:
+                        model_t.eval()
+                        output_t = model_t(input_var)
+                        loss_batch = criterion_batch(output_t, target_var)
+                    else:
+                        model.eval()
+                        output = model(input_var)
+                        loss_batch = criterion_batch(output, target_var)
                 else:
-                    model.train()
-                    output = model(input_var)
-                    loss_batch = 2 * args.clean_lam * criterion_batch(output,
-                                                                      target_var) / args.num_classes
+                    if args.supervision:
+                        model_t.train()
+                        output_t = model_t(input_var)
+                        loss_batch = 2 * args.clean_lam * criterion_batch(output_t,
+                                                                          target_var) / args.num_classes
+                    else:
+                        model.train()
+                        output = model(input_var)
+                        loss_batch = 2 * args.clean_lam * criterion_batch(output,
+                                                                        target_var) / args.num_classes
 
                 loss_batch_mean = torch.mean(loss_batch, dim=0)
                 loss_batch_mean.backward(retain_graph=True)
@@ -550,6 +573,14 @@ def main():
                                 nesterov=True)
 
     recorder = RecorderMeter(args.epochs)
+    
+    # loading the teacher supervision model
+    if args.supervision:
+        print_log("=> loading teacher model '{}'".format(args.model_t), log)
+        model_t = models.__dict__[args.model_t](num_classes=num_classes).cuda()
+        model_t.load_state_dict(torch.load('./pretrained_checkpoint/{}/ckpt/best.pth'.format(args.model_t))['state_dict'])
+        model_t = torch.nn.DataParallel(model_t, device_ids=list(range(args.ngpu)))
+        model_t.eval()
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -596,7 +627,7 @@ def main():
                 + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
 
         # train for one epoch
-        tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
+        tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, model_t = model_t, mp=mp)
 
         # evaluate on validation set
         val_acc, val_los = validate(test_loader, net, log)

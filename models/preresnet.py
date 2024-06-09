@@ -5,9 +5,10 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 import sys, os
 import numpy as np
+import time
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from mixup import to_one_hot, mixup_process, get_lambda
+from mixup import to_one_hot, mixup_process, get_lambda, collate_mix_batch
 import random
 
 
@@ -123,7 +124,9 @@ class PreActResNet(nn.Module):
                 noise=None,
                 adv_mask1=0,
                 adv_mask2=0,
-                mp=None):
+                mp=None,
+                PMU=0,
+                model_t = None):
 
         if mixup_hidden:
             layer_mix = random.randint(0, 2)
@@ -135,17 +138,30 @@ class PreActResNet(nn.Module):
         out = x
 
         if target is not None:
-            target_reweighted = to_one_hot(target, self.num_classes)
+            if layer_mix is not None:
+                target_reweighted_ohe = to_one_hot(target, self.num_classes)
+            else:
+                target_reweighted = to_one_hot(target, self.num_classes)
 
         if layer_mix == 0:
             out, target_reweighted = mixup_process(out,
-                                                   target_reweighted,
+                                                   target_reweighted_ohe,
                                                    args=args,
                                                    grad=grad,
                                                    noise=noise,
                                                    adv_mask1=adv_mask1,
                                                    adv_mask2=adv_mask2,
                                                    mp=mp)
+            
+            if args.unixkd:
+                PMU = int(PMU) # convert it to integer for slicing
+                out, target_reweighted = out[:PMU], target_reweighted[:PMU]
+            else:
+                out, target_reweighted = collate_mix_batch((x, target_reweighted_ohe), (out, target_reweighted), PMU=PMU)
+
+        if model_t is not None:
+            with torch.no_grad():
+                out_t = model_t(out)
 
         out = self.conv1(out)
         out = self.layer1(out)
@@ -165,10 +181,22 @@ class PreActResNet(nn.Module):
         out = out.reshape(out.size(0), -1)
         out = self.linear(out)
 
+        # if target is not None:
+        #     return out, target_reweighted
+        # else:
+        #     return out
+
         if target is not None:
-            return out, target_reweighted
+            if model_t is not None:
+                return out, target_reweighted, out_t
+            else:
+                return out, target_reweighted
+        
         else:
-            return out
+            if model_t is not None:
+                return out, out_t
+            else:
+                return out
 
 
 def preactresnet18(num_classes=10, dropout=False, stride=1):

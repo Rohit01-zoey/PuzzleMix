@@ -6,6 +6,50 @@ import gco
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
+# def collate_mix_batch(clean_batch, mixup_batch, PMU, strategy, sampler='random'):
+#     '''collates the new batch without or with replacement of clean images'''
+#     if strategy=='repl':
+#         mixup_number = int(PMU * len(clean_batch[0])) # number of mixup images to choose
+#         if sampler == 'random':
+#             mix_indices = np.random.choice(len(clean_batch[0]), mixup_number, replace=False)
+#             clean_indices = [i for i in range(len(clean_batch[0])) if i not in mix_indices]
+            
+#             selected_mix_imgs, selected_clean_imgs = mixup_batch[0][mix_indices], clean_batch[0][clean_indices]
+#             selected_mix_labels, selected_clean_labels = mixup_batch[1][mix_indices], clean_batch[1][clean_indices]
+            
+#             new_batch = (np.concatenate((selected_mix_imgs, selected_clean_imgs)),
+#                     np.concatenate((selected_mix_labels, selected_clean_labels)))
+#     return new_batch
+
+def collate_mix_batch(clean_batch, mixup_batch, PMU, strategy='repl', sampler='random'):
+    '''collates the new batch without or with replacement of clean images'''
+    if PMU == 0:
+        return clean_batch  # Return the clean batch if PMU is zero
+    elif PMU == 1:
+        return mixup_batch
+    else:
+        if strategy == 'repl':
+            num_clean_images = len(clean_batch[0])  # Assuming clean_batch[0] contains image data
+            mixup_number = int(PMU * num_clean_images)  # Number of mixup images to choose
+
+            if mixup_number > 0:  # Only perform operations if there are mixup images to process
+                if sampler == 'random':
+                    # Using PyTorch to handle indices for tensors
+                    random_perm = torch.randperm(num_clean_images)
+                    mix_indices, clean_indices = random_perm[:mixup_number], random_perm[mixup_number:]
+
+                    selected_mix_imgs = mixup_batch[0][mix_indices]
+                    selected_clean_imgs = clean_batch[0][clean_indices]
+                    selected_mix_labels = mixup_batch[1][mix_indices]
+                    selected_clean_labels = clean_batch[1][clean_indices]
+
+                    # Using torch.cat to concatenate tensors
+                    new_batch = (torch.cat((selected_mix_imgs, selected_clean_imgs), dim=0),
+                                torch.cat((selected_mix_labels, selected_clean_labels), dim=0))
+
+            return new_batch
+
+
 def to_one_hot(inp, num_classes, device='cuda'):
     '''one-hot label'''
     y_onehot = torch.zeros((inp.size(0), num_classes), dtype=torch.float32, device=device)

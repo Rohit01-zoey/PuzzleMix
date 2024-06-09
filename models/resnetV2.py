@@ -9,6 +9,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+from torch.autograd import Variable
+import sys, os
+import numpy as np
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from mixup import to_one_hot, mixup_process, get_lambda, collate_mix_batch
+import random
+
+
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -75,6 +84,7 @@ class Bottleneck(nn.Module):
 class ResNet(nn.Module):
     def __init__(self, block, num_blocks, num_classes=10, zero_init_residual=False):
         super(ResNet, self).__init__()
+        self.num_classes = num_classes
         self.in_planes = 64
 
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
@@ -138,28 +148,105 @@ class ResNet(nn.Module):
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
-    def forward(self, x, is_feat=False, preact=False):
-        out = F.relu(self.bn1(self.conv1(x)))
-        f0 = out
-        out, f1_pre = self.layer1(out)
-        f1 = out
-        out, f2_pre = self.layer2(out)
-        f2 = out
-        out, f3_pre = self.layer3(out)
-        f3 = out
-        out, f4_pre = self.layer4(out)
-        f4 = out
+    def forward(self,
+                x,
+                target=None,
+                mixup=False,
+                mixup_hidden=False,
+                args=None,
+                grad=None,
+                noise=None,
+                adv_mask1=0,
+                adv_mask2=0,
+                mp=None,
+                PMU=0,
+                model_t=None):
+        
+        if mixup_hidden:
+            layer_mix = random.randint(0, 2)
+        elif mixup:
+            layer_mix = 0
+        else:
+            layer_mix = None
+
+        out = x
+        
+        if target is not None:
+            target_reweighted_ohe = to_one_hot(target, self.num_classes)
+
+        if layer_mix == 0:
+            out, target_reweighted = mixup_process(out,
+                                                   target_reweighted_ohe,
+                                                   args=args,
+                                                   grad=grad,
+                                                   noise=noise,
+                                                   adv_mask1=adv_mask1,
+                                                   adv_mask2=adv_mask2,
+                                                   mp=mp)
+            
+            if args.unixkd:
+                PMU = int(PMU) # convert it to integer for slicing
+                out, target_reweighted = out[:PMU], target_reweighted[:PMU]
+            else:
+                out, target_reweighted = collate_mix_batch((x, target_reweighted_ohe), (out, target_reweighted), PMU=PMU)
+        
+        if model_t is not None:
+            with torch.no_grad():
+                out_t = model_t(out)
+        
+        out = self.conv1(out)
+        out = self.bn1(out)
+        out = F.relu(out)
+        out, _ = self.layer1(out)
+        
+        if layer_mix == 1:
+            out, target_reweighted = mixup_process(out, target_reweighted, args=args, hidden=True)
+
+        out, _ = self.layer2(out)
+        if layer_mix == 2:
+            out, target_reweighted = mixup_process(out, target_reweighted, args=args, hidden=True)
+
+        out, _ = self.layer3(out)
+        if layer_mix == 3:
+            out, target_reweighted = mixup_process(out, target_reweighted, args=args, hidden=True)
+        out, _ = self.layer4(out)
         out = self.avgpool(out)
         out = out.view(out.size(0), -1)
-        f5 = out
         out = self.linear(out)
-        if is_feat:
-            if preact:
-                return [[f0, f1_pre, f2_pre, f3_pre, f4_pre, f5], out]
+
+        if target is not None:
+            if model_t is not None:
+                return out, target_reweighted, out_t
             else:
-                return [f0, f1, f2, f3, f4, f5], out
+                return out, target_reweighted
+        
         else:
-            return out
+            if model_t is not None:
+                return out, out_t
+            else:
+                return out
+        
+        # out = F.relu(self.bn1(self.conv1(x)))
+        # f0 = out
+        # out, f1_pre = self.layer1(out)
+        # f1 = out
+        # out, f2_pre = self.layer2(out)
+        # f2 = out
+        # out, f3_pre = self.layer3(out)
+        # f3 = out
+        # out, f4_pre = self.layer4(out)
+        # f4 = out
+        # out = self.avgpool(out)
+        # out = out.view(out.size(0), -1)
+        # f5 = out
+        # out = self.linear(out)
+        # if is_feat:
+        #     if preact:
+        #         return [[f0, f1_pre, f2_pre, f3_pre, f4_pre, f5], out]
+        #     else:
+        #         return [f0, f1, f2, f3, f4, f5], out
+        # else:
+        #     return out
 
 
 def ResNet18(**kwargs):

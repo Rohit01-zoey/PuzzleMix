@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Variable
 from load_data import load_data_subset
 from logger import plotting, copy_script_to_folder, AverageMeter, RecorderMeter, time_string, convert_secs2time
@@ -115,7 +116,7 @@ parser.add_argument('--clean_lam', type=float, default=0.0, help='clean input re
 parser.add_argument('--mp', type=int, default=8, help='multi-process for graphcut (CPU)')
 
 # training
-parser.add_argument('--batch_size', type=int, default=100)
+parser.add_argument('--batch_size', type=int, default=64) #! earlier was set to 100!
 parser.add_argument('--learning_rate', type=float, default=0.1)
 parser.add_argument('--momentum', type=float, default=0.9)
 parser.add_argument('--decay', type=float, default=0.0001, help='weight decay (L2 penalty)')
@@ -166,8 +167,26 @@ parser.add_argument('--log_off', type=str2bool, default=False)
 parser.add_argument('--job_id', type=str, default='')
 
 
-parser.add_argument('--supervision', type=str2bool, default=False, help='whether to use supervision i.e. pretrained models for computing unary')
+parser.add_argument('--supervision', type=str2bool, default=False, help='whether to use supervision i.e. pretrained models for computing unary saliency measure')
+parser.add_argument('--kd', type=str2bool, default=False, help='whether to use knowledge distillation, uses model_t for teacher model')
 parser.add_argument('--model_t', type=str, default=None, help='model architecture for computing unary')
+
+#KD related shit
+parser.add_argument('--temp', type=float, default=1, help='Temperature for KD')
+parser.add_argument('--bce_weight', type=float, default=1, help = 'weightage for the BCE loss')
+parser.add_argument('--kl_weight', type=float, default=0.0, help = 'weightage for the KL loss')
+parser.add_argument('--pmu', type=float, default=0, help = 'fraction of Batch of mixup images to use')
+
+#mixup batch collater
+parser.add_argument('--mixup_batching_strategy', type=str, default='repl', help='replaces clean images with PMU*batch_size clean images')
+parser.add_argument('--mixup_batching_sampler', type=str, default='random', help='selects *mixup* images based on certain criteria')
+
+#UNIXkd
+parser.add_argument('--strategy', type=int, default=3, help='Stratergy to choose which criteria for uncertainty')
+parser.add_argument('--unixkd', type=str2bool, default=False, help="UNIXKD mode --sampling based on uncertainty")
+parser.add_argument('--k', required=False, type=int, default=64, help='The number of samples to be selected')
+parser.add_argument('--b', required=False, type=int, default=64, help='The centre of the sigmoid function')
+parser.add_argument('--w', required=False, type=int, default=1000, help='The width of the sigmoid function')
 
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
@@ -209,13 +228,24 @@ def experiment_name_non_mnist(dataset=args.dataset,
                               add_name=args.add_name,
                               clean_lam=args.clean_lam,
                               supervision=args.supervision,
+                              KD = args.kd,
                               model_t=args.model_t,
+                              bce_weight = args.bce_weight,
+                              kl_weight = args.kl_weight,
                               seed=args.seed):
     '''
     function for experiment result folder name.
     '''
-
-    exp_name = dataset
+    
+    if KD:
+        if args.unixkd:
+            exp_name = "UNIXKD_T[{}]_[CE W:{}]_[KL W:{}]_".format(model_t, bce_weight, kl_weight)
+        else:
+            exp_name = "KD_T[{}]_[CE W:{}]_[KL W:{}]_".format(model_t, bce_weight, kl_weight)
+    else:
+        exp_name = ""
+    exp_name += str(dataset)
+    # exp_name += '_BS_' + str(batch_size)
     exp_name += '_arch_' + str(arch)
     exp_name += '_train_' + str(train)
     exp_name += '_eph_' + str(epochs)
@@ -242,8 +272,10 @@ def experiment_name_non_mnist(dataset=args.dataset,
         exp_name += '_add_name_' + str(add_name)
     if supervision:
         exp_name += f'_supervision_[{str(model_t)}]'
+    if train not in ['vanilla']:
+        exp_name+= '_pmu_[' + str(args.pmu)+"]"
 
-    print('\nexperiement name: ' + exp_name)
+    print('\nexperiment name: ' + exp_name)
     return exp_name
 
 
@@ -296,6 +328,11 @@ def accuracy(output, target, topk=(1, )):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
+def kld_loss(out_s, out_t, T):
+    log_s_probs = torch.log_softmax(out_s/T, dim=1)
+    t_probs = torch.softmax(out_t/T, dim=1)
+    return F.kl_div(log_s_probs, t_probs, reduction='batchmean') * T*T
+
 
 bce_loss = nn.BCELoss().cuda()
 bce_loss_sum = nn.BCELoss(reduction='sum').cuda()
@@ -304,7 +341,7 @@ criterion = nn.CrossEntropyLoss().cuda()
 criterion_batch = nn.CrossEntropyLoss(reduction='none').cuda()
 
 
-def train(train_loader, model, optimizer, epoch, args, log, model_t = None, mp=None):
+def train(train_loader, model, optimizer, epoch, args, log, PMU = 0, model_t = None, mp=None):
     '''train given model and dataloader'''
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -317,7 +354,7 @@ def train(train_loader, model, optimizer, epoch, args, log, model_t = None, mp=N
     model.train()
     
     # see if model_t is given
-    if args.supervision:
+    if args.supervision or args.kd:
         model_t.eval()
 
     end = time.time()
@@ -327,7 +364,44 @@ def train(train_loader, model, optimizer, epoch, args, log, model_t = None, mp=N
 
         input = input.cuda()
         target = target.long().cuda()
+        
+        if args.unixkd:
+            with torch.no_grad():
+                student_outputs = model(input)
+                probs = torch.nn.functional.softmax(student_outputs, dim=1)
+        
+                # confidence
+                conf = probs.max(dim=1)[0]
+                # margin
+                rank = torch.argsort(probs, dim=1)
+                top2 = torch.gather(probs, dim=1, index=rank[:,-2:])
+                margin = top2[:,-1] - top2[:,-2]
+                # entropy
+                entropy = -torch.sum(probs * torch.log(probs), dim=1)
 
+                if args.strategy == 0:
+                    scores = torch.rand(input.size(0)).cuda()
+                elif args.strategy == 1:
+                    scores = 1 - conf
+                elif args.strategy == 2:
+                    scores = -margin
+                elif args.strategy == 3:
+                    scores = entropy
+                else: 
+                    raise ValueError('Invalid strategy.')
+                
+                rank = torch.argsort(scores, descending=True)
+                
+                r = torch.arange(input.size(0)).float()
+                m = (2*args.b-1) / (2*args.batch_size)
+                mask_proto = 1 / (1 + torch.exp(-args.w * (r/args.batch_size - m) ))
+                mask_proto = mask_proto.to('cuda')
+                    
+            # sort the inputs based on ranking
+            input = input[rank]
+            target = target[rank]
+
+        
         unary = None
         noise = None
         adv_mask1 = 0
@@ -336,8 +410,13 @@ def train(train_loader, model, optimizer, epoch, args, log, model_t = None, mp=N
         # train with clean images
         if args.train == 'vanilla':
             input_var, target_var = Variable(input), Variable(target)
-            output, reweighted_target = model(input_var, target_var)
-            loss = bce_loss(softmax(output), reweighted_target)
+            if args.kd:
+                output, reweighted_target, teacher_logits = model(input_var, target_var, model_t = model_t)
+                loss = args.bce_weight*bce_loss(softmax(output), reweighted_target) + args.kl_weight*kld_loss(out_s=output, out_t=teacher_logits, T=args.temp)
+            else:
+                output, reweighted_target = model(input_var, target_var)
+                #! loss = bce_loss(softmax(output), reweighted_target)
+                loss = criterion(output, target_var)
 
         # train with mixup images
         elif args.train == 'mixup':
@@ -405,16 +484,41 @@ def train(train_loader, model, optimizer, epoch, args, log, model_t = None, mp=N
 
             input_var, target_var = Variable(input), Variable(target)
             # perform mixup and calculate loss
-            output, reweighted_target = model(input_var,
-                                              target_var,
-                                              mixup=True,
-                                              args=args,
-                                              grad=unary,
-                                              noise=noise,
-                                              adv_mask1=adv_mask1,
-                                              adv_mask2=adv_mask2,
-                                              mp=mp)
-            loss = bce_loss(softmax(output), reweighted_target)
+            # output, reweighted_target = model(input_var,
+            #                                   target_var,
+            #                                   mixup=True,
+            #                                   args=args,
+            #                                   grad=unary,
+            #                                   noise=noise,
+            #                                   adv_mask1=adv_mask1,
+            #                                   adv_mask2=adv_mask2,
+            #                                   mp=mp)
+            
+            # perform mixup and calculate loss
+            if args.kd:
+                output, reweighted_target, teacher_logits = model(input_var,
+                                                                target_var,
+                                                                mixup=True,
+                                                                args=args,
+                                                                grad=unary,
+                                                                noise=noise,
+                                                                adv_mask1=adv_mask1,
+                                                                adv_mask2=adv_mask2,
+                                                                mp=mp,
+                                                                PMU = PMU,
+                                                                model_t=model_t)
+                loss = args.bce_weight*bce_loss(softmax(output), reweighted_target) + args.kl_weight*kld_loss(out_s=output, out_t=teacher_logits, T=args.temp)
+            else:
+                output, reweighted_target =  model(input_var,
+                                                    target_var,
+                                                    mixup=True,
+                                                    args=args,
+                                                    grad=unary,
+                                                    noise=noise,
+                                                    adv_mask1=adv_mask1,
+                                                    adv_mask2=adv_mask2,
+                                                    mp=mp)
+                loss = bce_loss(softmax(output), reweighted_target)
 
         # for manifold mixup
         elif args.train == 'mixup_hidden':
@@ -425,6 +529,9 @@ def train(train_loader, model, optimizer, epoch, args, log, model_t = None, mp=N
             raise AssertionError('wrong train type!!')
 
         # measure accuracy and record loss
+        if args.unixkd:
+            PMU = int(PMU) # convert it to integer for slicing
+            target = target[:PMU]
         prec1, prec5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
@@ -499,9 +606,20 @@ def validate(val_loader, model, log, fgsm=False, eps=4, rand_init=False, mean=No
 
 best_acc = 0
 
-
+def print_available_cuda_devices():
+    if torch.cuda.is_available():
+        num_devices = torch.cuda.device_count()
+        print(f"Number of available CUDA devices: {num_devices}")
+        for i in range(num_devices):
+            print(f"Device {i}: {torch.cuda.get_device_name(i)}")
+    else:
+        print("No CUDA devices available.")
+        
 def main():
     # set up the experiment directories
+    
+    print_available_cuda_devices()
+    
     if not args.log_off:
         exp_name = experiment_name_non_mnist()
         exp_dir = os.path.join(args.root_dir, exp_name)
@@ -562,7 +680,8 @@ def main():
 
     # create model
     print_log("=> creating model '{}'".format(args.arch), log)
-    net = models.__dict__[args.arch](num_classes, args.dropout, stride).cuda()
+    #net = models.__dict__[args.arch](num_classes, args.dropout, stride).cuda()
+    net = models.__dict__[args.arch](num_classes=num_classes).cuda()
     args.num_classes = num_classes
 
     net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
@@ -575,13 +694,18 @@ def main():
     recorder = RecorderMeter(args.epochs)
     
     # loading the teacher supervision model
-    if args.supervision:
+    if args.supervision or args.kd:
         print_log("=> loading teacher model '{}'".format(args.model_t), log)
         model_t = models.__dict__[args.model_t](num_classes=num_classes).cuda()
         model_t.load_state_dict(torch.load('./pretrained_checkpoint/{}/ckpt/best.pth'.format(args.model_t))['state_dict'])
         model_t = torch.nn.DataParallel(model_t, device_ids=list(range(args.ngpu)))
         model_t.eval()
-
+        
+        _, _ = validate(test_loader, model_t, log)
+    else:
+        print_log("=> not using KD or supervision mode so *NO* teacher model loaded!", log)
+        model_t = None
+        
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -623,11 +747,11 @@ def main():
 
         need_hour, need_mins, need_secs = convert_secs2time(epoch_time.avg * (args.epochs - epoch))
         need_time = '[Need: {:02d}:{:02d}:{:02d}]'.format(need_hour, need_mins, need_secs)
-        print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:6.4f}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
+        print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:.16e}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
                 + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
 
         # train for one epoch
-        tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, model_t = model_t, mp=mp)
+        tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, model_t = model_t, mp=mp, PMU = args.pmu)
 
         # evaluate on validation set
         val_acc, val_los = validate(test_loader, net, log)

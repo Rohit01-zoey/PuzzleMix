@@ -21,6 +21,10 @@ from logger import plotting, copy_script_to_folder, AverageMeter, RecorderMeter,
 import models
 from multiprocessing import Pool
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from mixup import to_one_hot, mixup_process, get_lambda, collate_mix_batch
+from z_optimizer import z_optimizer
+
 model_names = sorted(
     name for name in models.__dict__
     if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
@@ -77,7 +81,7 @@ parser.add_argument('--epochs', type=int, default=300, help='number of epochs to
 parser.add_argument('--train',
                     type=str,
                     default='vanilla',
-                    choices=['vanilla', 'mixup', 'mixup_hidden'],
+                    choices=['vanilla', 'mixup', 'mixup_hidden', 'optim_mix'],
                     help='mixup layer')
 parser.add_argument('--in_batch',
                     type=str2bool,
@@ -187,6 +191,12 @@ parser.add_argument('--unixkd', type=str2bool, default=False, help="UNIXKD mode 
 parser.add_argument('--k', required=False, type=int, default=64, help='The number of samples to be selected')
 parser.add_argument('--b', required=False, type=int, default=64, help='The centre of the sigmoid function')
 parser.add_argument('--w', required=False, type=int, default=1000, help='The width of the sigmoid function')
+
+#optimized mixup
+parser.add_argument('--mini_batch_size', type=int, default=4, help='mini batch size for optimized mixup')
+parser.add_argument('--alpha_optim', type=float, default=0.1, help='alpha parameter for optimized mixup')
+parser.add_argument('--beta_optim', type=float, default=0.1, help='beta parameter for optimized mixup')
+parser.add_argument('--strategy_optim', type=int, default=1, help='strategy for optimized mixup')
 
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
@@ -415,8 +425,49 @@ def train(train_loader, model, optimizer, epoch, args, log, PMU = 0, model_t = N
                 loss = args.bce_weight*bce_loss(softmax(output), reweighted_target) + args.kl_weight*kld_loss(out_s=output, out_t=teacher_logits, T=args.temp)
             else:
                 output, reweighted_target = model(input_var, target_var)
-                #! loss = bce_loss(softmax(output), reweighted_target)
-                loss = criterion(output, target_var)
+                loss = bce_loss(softmax(output), reweighted_target)
+                
+        #! train with optimized mixup images
+        
+        elif args.train == 'optim_mix':
+            input_var, target_var = Variable(input), Variable(target)
+            # TODO: Add student uncertainties here 
+            with torch.no_grad():
+                student_outputs = model(input_var)
+                probs = torch.nn.functional.softmax(student_outputs, dim=1)
+                
+                if args.strategy_optim == 1:
+                    scores = probs.max(dim=1)[0] # compute the confidence
+                elif args.strategy_optim == 2:
+                    rank = torch.argsort(probs, dim=1)
+                    top2 = torch.gather(probs, dim=1, index=rank[:,-2:])
+                    scores = top2[:,-1] - top2[:,-2] # compute the margin
+                elif args.strategy_optim == 3:
+                    scores = -torch.sum(probs * torch.log(probs), dim=1) # computes the entropy
+                else: 
+                    raise ValueError('Invalid strategy.')
+            # TODO: pass the uncertainties to the model and optimize the mixup images
+            scores = scores.cpu().numpy()
+            indices = list(range(input_var.shape[0])) 
+            random.shuffle(indices)
+            groups = [indices[i:i + args.mini_batch_size] for i in range(0, len(indices), args.mini_batch_size)]
+            # Initialize a large Z matrix of zeros
+            big_Z = torch.zeros((input_var.shape[0], input_var.shape[0])).cuda()
+            # Fill big_Z with smaller Z matrices on its diagonal according to the shuffled indices
+            for group in groups:
+                mix_z = z_optimizer(args.mini_batch_size, args.mini_batch_size)(scores[group], alpha=args.alpha_optim, beta=args.beta_optim, print_message=False)
+                for i, row in enumerate(group):
+                    for j, col in enumerate(group):
+                        big_Z[row, col] = mix_z[i, j]
+            
+            reweighted_target = to_one_hot(target_var, args.num_classes)
+            batch_size, channel, height, width = input_var.shape
+            flattened_input = input_var.view(batch_size, -1)
+            flattened_input, reweighted_target = big_Z@flattened_input, big_Z@reweighted_target # alterting the images
+            input_var = Variable(flattened_input.view(batch_size, channel, height, width), requires_grad=True)
+            
+            output= model(input_var)
+            loss = bce_loss(softmax(output), reweighted_target)
 
         # train with mixup images
         elif args.train == 'mixup':
